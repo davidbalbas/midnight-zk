@@ -19,10 +19,13 @@ use sha2::Digest;
 
 type F = midnight_curves::Fq;
 
-/// Circuit size parameter (log2 of rows).  K=15 fits ~4 SHA-256 gadgets.
-pub const K: u32 = 15;
-
 /// Number of SHA-256 gadgets instantiated inside each circuit.
+///
+/// The `protogalaxy` example sizes the circuit with `optimal_k`, which returns
+/// K=13 for every `N_SHA` in 1..=4 — the SHA-256 gadgets fit within the same
+/// power-of-two row count, so this knob changes witness-generation cost but
+/// leaves the trace dimensions (and hence steps 5 and 6 of folding) untouched.
+/// Keep it fixed when comparing folding runs.
 pub const N_SHA: usize = 4;
 
 /// Number of public input field elements (32 bytes, 1 field element each).

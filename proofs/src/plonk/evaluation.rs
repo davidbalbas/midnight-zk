@@ -65,6 +65,23 @@ pub enum Calculation {
     Store(ValueSource),
 }
 
+/// The auxiliary polynomials of one logup argument, already in the target
+/// representation `B`.
+///
+/// [`Evaluator::evaluate_numerator_prepared`] takes these instead of the
+/// coefficient-form `logup::prover::Committed`, so a caller that already holds
+/// them in representation `B` pays no conversion. Folding is linear and
+/// commutes with the basis change, which is what lets the protogalaxy prover
+/// convert once per input trace rather than once per evaluation point.
+pub(crate) struct LookupAux<'a, F, B> {
+    /// Per-chunk helper (inverse-sum) polynomials.
+    pub helpers: &'a [Polynomial<F, B>],
+    /// Running aggregator polynomial.
+    pub aggregator: &'a Polynomial<F, B>,
+    /// Multiplicities of the looked-up values.
+    pub multiplicities: &'a Polynomial<F, B>,
+}
+
 /// Wraps a `GraphEvaluator` for lookups with named handles to the evaluator
 /// outputs.
 #[derive(Clone, Debug)]
@@ -783,6 +800,14 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
     /// processing, `previous_value` is always `F::ZERO` and the leading
     /// `Add(prev, 0)` flat op is dead.
     #[allow(clippy::too_many_arguments)]
+    /// Evaluates the numerator, converting the coefficient-form auxiliary
+    /// polynomials into representation `B` first.
+    ///
+    /// Thin wrapper over [`Self::evaluate_numerator_prepared`]; a caller that
+    /// already holds those polynomials in representation `B` should call the
+    /// prepared variant directly and skip the conversion, which is one FFT per
+    /// polynomial.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn evaluate_numerator<B: PolynomialRepresentation>(
         &self,
         domain: &EvaluationDomain<F>,
@@ -798,6 +823,82 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         lookups: &[logup::prover::Committed<F>],
         trashcans: &[trash::prover::Committed<F>],
         permutation: &permutation::prover::Committed<F>,
+        l0: &Polynomial<F, B>,
+        l_last: &Polynomial<F, B>,
+        l_active_row: &Polynomial<F, B>,
+        permutation_pk_cosets: &[Polynomial<F, B>],
+    ) -> Polynomial<F, B> {
+        let perm_products: Vec<Polynomial<F, B>> = permutation
+            .sets
+            .par_iter()
+            .map(|set| B::coeff_to_self(domain, set.permutation_product_poly.clone()))
+            .collect();
+
+        let lookup_owned: Vec<(Vec<Polynomial<F, B>>, Polynomial<F, B>, Polynomial<F, B>)> =
+            lookups
+                .par_iter()
+                .map(|lookup| {
+                    let helpers: Vec<Polynomial<F, B>> = lookup
+                        .helper_polys
+                        .iter()
+                        .map(|h| B::coeff_to_self(domain, h.clone()))
+                        .collect();
+                    let aggregator = B::coeff_to_self(domain, lookup.aggregator_poly.clone());
+                    let multiplicities = B::coeff_to_self(domain, lookup.multiplicities.clone());
+                    (helpers, aggregator, multiplicities)
+                })
+                .collect();
+
+        let trash_polys: Vec<Polynomial<F, B>> = trashcans
+            .par_iter()
+            .map(|trash| B::coeff_to_self(domain, trash.trash_poly.clone()))
+            .collect();
+
+        let lookup_aux: Vec<LookupAux<'_, F, B>> = lookup_owned
+            .iter()
+            .map(|(helpers, aggregator, multiplicities)| LookupAux {
+                helpers,
+                aggregator,
+                multiplicities,
+            })
+            .collect();
+
+        self.evaluate_numerator_prepared(
+            domain,
+            cs,
+            advice,
+            instance,
+            fixed,
+            y,
+            beta,
+            gamma,
+            theta,
+            trash_challenge,
+            &lookup_aux,
+            &trash_polys,
+            &perm_products,
+            l0,
+            l_last,
+            l_active_row,
+            permutation_pk_cosets,
+        )
+    }
+
+    pub(crate) fn evaluate_numerator_prepared<B: PolynomialRepresentation>(
+        &self,
+        domain: &EvaluationDomain<F>,
+        cs: &ConstraintSystem<F>,
+        advice: &[Polynomial<F, B>],
+        instance: &[Polynomial<F, B>],
+        fixed: &[Polynomial<F, B>],
+        y: &[F],
+        beta: F,
+        gamma: F,
+        theta: &[F],
+        trash_challenge: F,
+        lookup_aux: &[LookupAux<'_, F, B>],
+        trash_polys: &[Polynomial<F, B>],
+        perm_products: &[Polynomial<F, B>],
         l0: &Polynomial<F, B>,
         l_last: &Polynomial<F, B>,
         l_active_row: &Polynomial<F, B>,
@@ -827,17 +928,14 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
         let n_gate_polys: usize = cs.gates.iter().map(|g| g.polynomials().len()).sum();
 
         // Permutations
-        let sets = &permutation.sets;
+        let sets = perm_products;
         if !sets.is_empty() {
             let blinding_factors = cs.blinding_factors();
             let last_rotation = Rotation(-((blinding_factors + 1) as i32));
             let chunk_len = cs.degree() - 2;
             let delta_start = beta * &B::g_coset(domain);
 
-            let permutation_product_cosets: Vec<Polynomial<F, B>> = sets
-                .par_iter()
-                .map(|set| B::coeff_to_self(domain, set.permutation_product_poly.clone()))
-                .collect();
+            let permutation_product_cosets = perm_products;
 
             let first_set_permutation_product_coset = permutation_product_cosets.first().unwrap();
             let last_set_permutation_product_coset = permutation_product_cosets.last().unwrap();
@@ -929,25 +1027,8 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
             .collect();
         let idx_y_trash_start = idx_y_lookup;
 
-        // Pre-compute all lookup cosets in parallel.
-        let all_lookup_cosets: Vec<_> = lookups
-            .par_iter()
-            .map(|lookup| {
-                let helper_cosets: Vec<_> = lookup
-                    .helper_polys
-                    .iter()
-                    .map(|h| B::coeff_to_self(domain, h.clone()))
-                    .collect();
-                let aggregator_coset = B::coeff_to_self(domain, lookup.aggregator_poly.clone());
-                let multiplicities_coset = B::coeff_to_self(domain, lookup.multiplicities.clone());
-                (helper_cosets, aggregator_coset, multiplicities_coset)
-            })
-            .collect();
-
-        let trash_cosets: Vec<_> = trashcans
-            .par_iter()
-            .map(|trash| B::coeff_to_self(domain, trash.trash_poly.clone()))
-            .collect();
+        let all_lookup_cosets = lookup_aux;
+        let trash_cosets = trash_polys;
 
         // Pre-resolve lookup output indices for the flat evaluator.
         let lookup_output_indices: Vec<Vec<(usize, usize, usize, usize)>> = self
@@ -1014,9 +1095,9 @@ impl<F: WithSmallOrderMulGroup<3>> Evaluator<F> {
                 let r_next = get_rotation_idx(idx, 1, log_scale, log_n);
 
                 // --- Lookup constraints ---
-                for (n, (helper_cosets, aggregator_coset, multiplicities_coset)) in
-                    all_lookup_cosets.iter().enumerate()
-                {
+                for (n, aux) in all_lookup_cosets.iter().enumerate() {
+                    let (helper_cosets, aggregator_coset, multiplicities_coset) =
+                        (aux.helpers, aux.aggregator, aux.multiplicities);
                     let iy = lookup_y_starts[n];
 
                     // Boundary: Z(X) = 0 at l_0 and l_last
@@ -1314,7 +1395,7 @@ mod tests {
     }
 
     // Note: We need this instead of Expression::evaluate to test for
-    // Horner and Store as well.
+    // Store as well.
     /// Reference evaluator for `GraphEvaluator` without flattening.
     #[allow(clippy::too_many_arguments)]
     fn ref_evaluate(
@@ -1324,9 +1405,9 @@ mod tests {
         instance: &[Polynomial<Fq, LagrangeCoeff>],
         rots: &[usize],
         beta: Fq,
-        theta: Fq,
+        theta: &[Fq],
         tc: Fq,
-        y: Fq,
+        y: &[Fq],
         prev: Fq,
     ) -> Fq {
         let mut im = vec![Fq::ZERO; graph.num_intermediates];
@@ -1337,9 +1418,9 @@ mod tests {
             ValueSource::Advice(c, k) => advice[c][rots[k]],
             ValueSource::Instance(c, k) => instance[c][rots[k]],
             ValueSource::Beta() => beta,
-            ValueSource::Theta() => theta,
+            ValueSource::Theta(i) => theta[i],
             ValueSource::TrashChallenge() => tc,
-            ValueSource::Y() => y,
+            ValueSource::Y(i) => y[i],
             ValueSource::PreviousValue() => prev,
         };
         for ci in &graph.calculations {
@@ -1351,14 +1432,6 @@ mod tests {
                 Calculation::Double(v) => r(v, &im).double(),
                 Calculation::Negate(v) => -r(v, &im),
                 Calculation::Store(v) => r(v, &im),
-                Calculation::Horner(s, parts, f) => {
-                    let fv = r(f, &im);
-                    let mut acc = r(s, &im);
-                    for p in parts {
-                        acc = acc * fv + r(p, &im);
-                    }
-                    acc
-                }
             };
         }
         *im.last().expect("non-empty graph")
@@ -1379,14 +1452,15 @@ mod tests {
 
         let prev: Vec<_> = (0..n).map(|_| Fq::random(&mut rng)).collect();
 
-        let (beta, theta, tc, y) = (
-            Fq::random(&mut rng),
-            Fq::random(&mut rng),
-            Fq::random(&mut rng),
-            Fq::random(&mut rng),
-        );
-
         let flat = graph.flatten();
+
+        // `theta` and `y` are indexed challenge vectors; size them from the
+        // flattened graph, which derives its slot counts from the highest
+        // `Theta(i)` / `Y(i)` index appearing in the calculations.
+        let (beta, tc) = (Fq::random(&mut rng), Fq::random(&mut rng));
+        let theta: Vec<Fq> = (0..flat.n_theta).map(|_| Fq::random(&mut rng)).collect();
+        let y: Vec<Fq> = (0..flat.n_y).map(|_| Fq::random(&mut rng)).collect();
+
         let challenges = flat.new_values_buffer(&beta, &theta, &tc, &y);
         let rots = |idx: usize| -> Vec<usize> {
             graph
@@ -1405,9 +1479,9 @@ mod tests {
                     &instance,
                     &rots(idx),
                     beta,
-                    theta,
+                    &theta,
                     tc,
-                    y,
+                    &y,
                     prev[idx],
                 )
             })
@@ -1491,20 +1565,25 @@ mod tests {
         let sq = g.add_calculation(Calculation::Square(a0));
         let dbl = g.add_calculation(Calculation::Double(f1));
         let neg = g.add_calculation(Calculation::Negate(mul));
+        // Named challenge slots, including two distinct `theta` indices.
         let wb = g.add_calculation(Calculation::Mul(add, ValueSource::Beta()));
-        let wt = g.add_calculation(Calculation::Add(wb, ValueSource::Theta()));
-        let wc = g.add_calculation(Calculation::Sub(wt, ValueSource::TrashChallenge()));
+        let wt = g.add_calculation(Calculation::Add(wb, ValueSource::Theta(0)));
+        let wt1 = g.add_calculation(Calculation::Mul(wt, ValueSource::Theta(1)));
+        let wc = g.add_calculation(Calculation::Sub(wt1, ValueSource::TrashChallenge()));
 
         // Constant as a Calculation operand.
         let with_const = g.add_calculation(Calculation::Add(neg, ValueSource::Constant(2)));
 
-        // Horner calculation to compute linear combination on challenge Y of previous
-        // calculations.
-        g.add_calculation(Calculation::Horner(
-            ValueSource::PreviousValue(),
-            vec![sq, dbl, neg, wc, with_const],
-            ValueSource::Y(),
-        ));
+        // Linear combination of the previous calculations, seeded with the
+        // previous value. `Calculation::Horner` no longer exists, so build the
+        // same accumulation (accⱼ₊₁ = accⱼ·yⱼ + partⱼ) out of Mul/Add, which
+        // also exercises several independent `y` slots.
+        let parts = [sq, dbl, neg, wc, with_const];
+        let mut acc = ValueSource::PreviousValue();
+        for (j, part) in parts.into_iter().enumerate() {
+            let scaled = g.add_calculation(Calculation::Mul(acc, ValueSource::Y(j)));
+            acc = g.add_calculation(Calculation::Add(scaled, part));
+        }
         check_graph(&g, 16, 0xCAFE);
 
         // Expression path: q * (a * b - c) + 7 * d.
