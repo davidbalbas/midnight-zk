@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Accordion (Protogalaxy k-folding) vs k-Plonk benchmark driver.
 
-Builds and runs the `accordion_bench` example of `midnight-aggregation` once
-per (circuit, scheme, k), averages the repetitions and renders one comparison
-table per circuit. See `README.md` next to this file for usage.
+Builds the `accordion_bench` example of `midnight-aggregation` and runs it
+once per circuit (setup once, then every (k, scheme) in turn), averages the
+repetitions and renders one comparison table per circuit. See `README.md` next
+to this file for usage.
 
 Only the Python standard library is needed.
 """
@@ -144,22 +145,27 @@ def build():
     sys.exit("error: could not locate the built example binary")
 
 
-# ── Running one configuration ────────────────────────────────────────────────
+# ── Running one circuit ──────────────────────────────────────────────────────
 
 
-def run_config(binary, circuit, scheme, k, reps, env, log_path, mem_limit, timeout):
-    """Runs one (circuit, scheme, k) process and returns its result record."""
-    record = {
-        "circuit": circuit,
-        "scheme": scheme,
-        "k": k,
-        "status": "ok",
-        "setup": None,
-        "reps": [],
-        "log": str(log_path),
-    }
-    cmd = [binary, circuit, scheme, str(k), str(reps)]
-    t0 = time.monotonic()
+def label(circuit, scheme, k):
+    return f"{CIRCUITS[circuit]} / {SCHEMES[scheme]} / k={k}"
+
+
+def run_process(binary, circuit, todo, reps, env, log_path, mem_limit, timeout,
+                results, flush):
+    """Runs one benchmark process over `todo`, a list of (k, scheme).
+
+    The process does the setup once, then each configuration in turn. A record
+    is appended to `results["runs"]` as each configuration starts. Returns
+    `(records, setup_done, failure)`, where `failure` is None on a clean exit
+    and otherwise a `(status, killed_by)` pair.
+    """
+    cmd = [binary, circuit, str(reps)] + [f"{scheme}:{k}" for k, scheme in todo]
+    records, starts = [], []
+    state = {"setup_done": False, "dirty": False}
+    lock = threading.Lock()
+
     with open(log_path, "a") as log_file:
         log_file.write("$ " + " ".join(cmd) + "\n")
         log_file.flush()
@@ -174,35 +180,63 @@ def run_config(binary, circuit, scheme, k, reps, env, log_path, mem_limit, timeo
                 if not line.startswith("BENCH "):
                     continue
                 data = json.loads(line[len("BENCH "):])
-                if data.pop("type") == "setup":
-                    record["setup"] = data
-                    log(f"    setup {data['setup_s']:.1f} s")
-                else:
-                    record["reps"].append(data)
-                    log(
-                        f"    rep {data['rep'] + 1}/{reps}: "
-                        f"prover {data['prover_s']:.2f} s, "
-                        f"verifier {data['verifier_s'] * 1e3:.1f} ms, "
-                        f"peak {data['peak_rss_bytes'] / MIB:,.0f} MiB"
-                    )
+                kind = data.pop("type")
+                with lock:
+                    if kind == "setup":
+                        state["setup_done"] = True
+                        results["setup"].setdefault(circuit, data)
+                        log(f"==> {CIRCUITS[circuit]}: setup done in "
+                            f"{data['setup_s']:.1f} s (K = {data['k_log']})")
+                    elif kind == "config":
+                        now = time.monotonic()
+                        if records:
+                            records[-1]["wall_s"] = now - starts[-1]
+                        rec = {
+                            "circuit": circuit, "scheme": data["scheme"],
+                            "k": data["k"], "status": "running", "reps": [],
+                            "log": str(log_path), "peak_rss_seen_bytes": 0,
+                        }
+                        records.append(rec)
+                        starts.append(now)
+                        results["runs"].append(rec)
+                        log(f"==> {label(circuit, rec['scheme'], rec['k'])}")
+                    else:
+                        records[-1]["reps"].append(data)
+                        if len(records[-1]["reps"]) == reps:
+                            records[-1]["status"] = "ok"
+                        log(
+                            f"    rep {data['rep'] + 1}/{reps}: "
+                            f"prover {data['prover_s']:.2f} s, "
+                            f"verifier {data['verifier_s'] * 1e3:.1f} ms, "
+                            f"peak {data['peak_rss_bytes'] / MIB:,.0f} MiB"
+                        )
+                    state["dirty"] = True
 
         reader = threading.Thread(target=read_stdout, daemon=True)
         reader.start()
 
-        peak_seen = 0
+        failure = None
         try:
             while proc.poll() is None:
+                with lock:
+                    current = records[-1] if records else None
+                    started_at = starts[-1] if starts else None
+                    if state["dirty"]:
+                        flush()
+                        state["dirty"] = False
                 rss = rss_bytes(proc.pid)
                 if rss is not None:
-                    peak_seen = max(peak_seen, rss)
+                    if current is not None:
+                        current["peak_rss_seen_bytes"] = max(
+                            current["peak_rss_seen_bytes"], rss
+                        )
                     if mem_limit and rss > mem_limit:
                         proc.kill()
-                        record["status"] = "oom"
-                        record["killed_by"] = "guard"
+                        failure = ("oom", "guard")
                         break
-                if timeout and time.monotonic() - t0 > timeout:
+                if timeout and started_at and time.monotonic() - started_at > timeout:
                     proc.kill()
-                    record["status"] = "timeout"
+                    failure = ("timeout", None)
                     break
                 time.sleep(0.2)
         finally:
@@ -212,22 +246,98 @@ def run_config(binary, circuit, scheme, k, reps, env, log_path, mem_limit, timeo
             proc.wait()
             reader.join()
 
-    record["wall_s"] = time.monotonic() - t0
-    record["peak_rss_seen_bytes"] = peak_seen
-    record["returncode"] = proc.returncode
-    if record["status"] == "ok" and proc.returncode != 0:
-        # SIGKILL we did not send is almost always the kernel's OOM killer.
+    if failure is None and proc.returncode != 0:
+        # A SIGKILL we did not send is almost always the kernel's OOM killer.
         if proc.returncode == -signal.SIGKILL:
-            record["status"] = "oom"
-            record["killed_by"] = "kernel"
+            failure = ("oom", "kernel")
         else:
-            record["status"] = "error"
-    if record["status"] == "ok" and len(record["reps"]) != reps:
-        record["status"] = "error"
-    return record
+            failure = ("error", None)
+
+    now = time.monotonic()
+    for rec, started_at in zip(records, starts):
+        rec.setdefault("wall_s", now - started_at)
+        if len(rec["reps"]) == reps:
+            rec["status"] = "ok"
+    if records and records[-1]["status"] == "running":
+        # The process died while running this configuration.
+        records[-1]["status"], killed_by = failure or ("error", None)
+        if killed_by:
+            records[-1]["killed_by"] = killed_by
+    return records, state["setup_done"], failure
+
+
+def run_circuit(binary, circuit, configs, reps, env, log_path, mem_limit, timeout,
+                results, flush):
+    """Runs every configuration of one circuit, restarting after failures.
+
+    After an OOM, larger k of the same scheme are skipped.
+    """
+    oom_at = {}
+    pending = list(configs)
+    while pending:
+        todo = []
+        for k, scheme in pending:
+            if scheme in oom_at and k > oom_at[scheme]:
+                log(f"==> {label(circuit, scheme, k)}: skipped")
+                results["runs"].append({
+                    "circuit": circuit, "scheme": scheme, "k": k,
+                    "status": "skipped", "reps": [],
+                    "reason": f"skipped (OOM at k={oom_at[scheme]})",
+                })
+            else:
+                todo.append((k, scheme))
+        flush()
+        if not todo:
+            return
+
+        records, setup_done, failure = run_process(
+            binary, circuit, todo, reps, env, log_path, mem_limit, timeout,
+            results, flush,
+        )
+        for rec in records:
+            if rec["status"] == "oom":
+                oom_at[rec["scheme"]] = rec["k"]
+            if rec["status"] not in ("ok", "running"):
+                log(f"    {rec['status'].upper()} after {rec['wall_s']:.0f} s "
+                    f"(log: {rec['log']})")
+
+        started = len(records)
+        if failure is None and started < len(todo):
+            # Clean exit without running everything: should not happen, but
+            # never loop on it.
+            failure = ("error", None)
+        outside = not records or records[-1]["status"] == "ok"
+        if failure is not None and (not setup_done or outside):
+            # The process died outside any configuration (during setup, or
+            # between two configurations): charge it to the next one, or to all
+            # of them if the setup itself failed.
+            blamed = todo[started:] if not setup_done else todo[started:started + 1]
+            for k, scheme in blamed:
+                rec = {
+                    "circuit": circuit, "scheme": scheme, "k": k,
+                    "status": failure[0], "reps": [], "log": str(log_path),
+                }
+                if failure[1]:
+                    rec["killed_by"] = failure[1]
+                results["runs"].append(rec)
+            log(f"    {failure[0].upper()} "
+                f"{'during setup' if not setup_done else 'between runs'} "
+                f"(log: {log_path})")
+            started += len(blamed)
+        pending = todo[started:]
+        if pending and failure is not None:
+            log(f"    restarting {CIRCUITS[circuit]} for the remaining runs")
+    flush()
 
 
 # ── Aggregation and rendering ────────────────────────────────────────────────
+
+
+def fmt_size(nbytes):
+    """GiB with one decimal, or MiB below 1 GiB."""
+    if nbytes < GIB:
+        return f"{nbytes / MIB:,.0f} MiB"
+    return f"{nbytes / GIB:.1f} GiB"
 
 
 def mean_sd(values):
@@ -237,12 +347,12 @@ def mean_sd(values):
     return m, sd
 
 
-def summarize(record):
+def summarize(record, results):
     """Per-configuration aggregates (means over repetitions)."""
     reps = record["reps"]
     if record["status"] != "ok" or not reps:
         return None
-    threads = record["setup"]["threads"]
+    threads = results["setup"][record["circuit"]]["threads"]
     prover = [r["prover_s"] for r in reps]
     verifier = [r["verifier_s"] * 1e3 for r in reps]
     cores = [r["prover_cpu_s"] / r["prover_s"] / threads * 100 for r in reps]
@@ -270,10 +380,12 @@ def failure_text(record, mem_limit):
     if status == "oom":
         limit = record.get("mem_limit_bytes") or mem_limit
         if record.get("killed_by") == "guard" and limit:
-            return f"OOM (> {limit / GIB:.1f} GiB)"
+            return f"OOM (> {fmt_size(limit)})"
         return "OOM (killed by the kernel)"
     if status == "timeout":
         return "timeout"
+    if status == "interrupted":
+        return "interrupted"
     if status == "skipped":
         return record.get("reason", "skipped")
     return "failed (see log)"
@@ -323,8 +435,8 @@ def render_markdown(results):
         + (
             "(includes the SRS and keys held in memory; setup transients excluded)."
             if all(
-                (r.get("setup") or {}).get("peak_rss_scope", "prover") == "prover"
-                for r in results["runs"]
+                setup.get("peak_rss_scope") == "prover"
+                for setup in results["setup"].values()
             )
             else "(on this platform: over the whole process, setup included)."
         ),
@@ -336,7 +448,7 @@ def render_markdown(results):
         runs = [r for r in results["runs"] if r["circuit"] == circuit]
         if not runs:
             continue
-        setup = next((r["setup"] for r in runs if r.get("setup")), None)
+        setup = results["setup"].get(circuit)
         threads = setup["threads"] if setup else None
         lines += [f"## {CIRCUITS[circuit]}", ""]
         if setup:
@@ -353,7 +465,7 @@ def render_markdown(results):
                 )
                 if rec is None:
                     continue
-                s = summarize(rec)
+                s = summarize(rec, results)
                 if s is None:
                     cells = [failure_text(rec, meta.get("mem_limit_bytes"))] + ["—"] * 4
                 else:
@@ -382,8 +494,8 @@ def render_csv(results):
     ]
     rows = [",".join(header)]
     for rec in results["runs"]:
-        s = summarize(rec)
-        k_log = (rec.get("setup") or {}).get("k_log", "")
+        s = summarize(rec, results)
+        k_log = results["setup"].get(rec["circuit"], {}).get("k_log", "")
         if s is None:
             rows.append(
                 f"{rec['circuit']},{rec['scheme']},{rec['k']},{rec['status']},"
@@ -437,11 +549,11 @@ def parse_args():
                    help="kill a run whose RSS exceeds this many GiB and report it as OOM "
                    "(default: 90%% of the memory available at start; 0 disables; Linux only)")
     p.add_argument("--timeout", type=float, default=None, metavar="MIN",
-                   help="kill a (circuit, scheme, k) run after this many minutes")
+                   help="stop a (scheme, k) run after this many minutes")
     p.add_argument("--threads", type=int, default=None,
                    help="number of prover threads (sets RAYON_NUM_THREADS)")
     p.add_argument("--cooldown", type=float, default=0, metavar="SEC",
-                   help="pause between runs, to let a laptop cool down (default: 0)")
+                   help="pause between (scheme, k) runs, to let a laptop cool down (default: 0)")
     p.add_argument("--no-build", action="store_true",
                    help="do not rebuild; use the existing release binary")
     p.add_argument("--render", type=Path, default=None, metavar="DIR",
@@ -511,6 +623,8 @@ def main():
     if args.threads:
         env["RAYON_NUM_THREADS"] = str(args.threads)
         machine["rayon_num_threads"] = str(args.threads)
+    if args.cooldown:
+        env["ACCORDION_BENCH_COOLDOWN"] = str(args.cooldown)
 
     results = {
         "meta": {
@@ -522,51 +636,34 @@ def main():
             "mem_limit_bytes": mem_limit,
             "machine": machine,
         },
+        "setup": {},
         "runs": [],
     }
 
     log(f"Output directory: {out_dir}")
     log(
         "Memory guard: "
-        + (f"{mem_limit / GIB:.1f} GiB" if mem_limit else "disabled")
+        + (fmt_size(mem_limit) if mem_limit else "disabled")
     )
 
-    # After an OOM, larger widths of the same (circuit, scheme) are skipped.
-    oom_at = {}
-    first = True
+    # For each k, Accordion and k-Plonk run back to back.
+    configs = [(k, scheme) for k in args.widths for scheme in args.schemes]
     try:
-        for circuit in args.circuits:
-            for k in args.widths:
-                for scheme in args.schemes:
-                    label = f"{CIRCUITS[circuit]} / {SCHEMES[scheme]} / k={k}"
-                    if (circuit, scheme) in oom_at:
-                        log(f"==> {label}: skipped")
-                        results["runs"].append({
-                            "circuit": circuit, "scheme": scheme, "k": k,
-                            "status": "skipped", "setup": None, "reps": [],
-                            "reason": f"skipped (OOM at k={oom_at[(circuit, scheme)]})",
-                        })
-                        write_outputs(out_dir, results)
-                        continue
-                    if not first and args.cooldown:
-                        time.sleep(args.cooldown)
-                    first = False
-                    log(f"==> {label}")
-                    rec = run_config(
-                        binary, circuit, scheme, k, args.reps, env,
-                        out_dir / "logs" / f"{circuit}-{scheme}-k{k}.log",
-                        mem_limit,
-                        args.timeout * 60 if args.timeout else None,
-                    )
-                    rec["mem_limit_bytes"] = mem_limit
-                    results["runs"].append(rec)
-                    if rec["status"] != "ok":
-                        log(f"    {rec['status'].upper()} after {rec['wall_s']:.0f} s "
-                            f"(log: {rec['log']})")
-                    if rec["status"] == "oom":
-                        oom_at[(circuit, scheme)] = k
-                    write_outputs(out_dir, results)
+        for i, circuit in enumerate(args.circuits):
+            if i > 0 and args.cooldown:
+                time.sleep(args.cooldown)
+            run_circuit(
+                binary, circuit, configs, args.reps, env,
+                out_dir / "logs" / f"{circuit}.log",
+                mem_limit,
+                args.timeout * 60 if args.timeout else None,
+                results,
+                lambda: write_outputs(out_dir, results),
+            )
     except KeyboardInterrupt:
+        for rec in results["runs"]:
+            if rec["status"] == "running":
+                rec["status"] = "interrupted"
         log("\nInterrupted; writing partial results.")
 
     log("")

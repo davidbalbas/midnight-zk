@@ -9,15 +9,20 @@
 //! - `plonk`: `k` independent PLONK proofs of `k` fresh instances, then `k`
 //!   independent verifications.
 //!
-//! Each repetition prints one `BENCH {json}` line on stdout. This example is
-//! meant to be driven by `aggregation/scripts/bench_accordion.py`, which runs
-//! one process per (circuit, scheme, k), averages the repetitions and renders
-//! the comparison tables. It can also be run by hand:
+//! One process benchmarks one circuit: it runs the setup (SRS, keys) once, then
+//! each requested `scheme:k` configuration in turn, `reps` times each. It
+//! prints one `BENCH {json}` line for the setup, one when each configuration
+//! starts, and one per repetition, on stdout. This example is meant to be
+//! driven by `aggregation/scripts/bench_accordion.py`, which averages the
+//! repetitions and renders the comparison tables. It can also be run by hand:
 //!
 //! ```text
 //! cargo run --release -p midnight-aggregation --example accordion_bench -- \
-//!     <sha|ecdsa> <accordion|plonk> <k> [reps]
+//!     <sha|ecdsa> <reps> <accordion|plonk>:<k>...
 //! ```
+//!
+//! Setting `ACCORDION_BENCH_COOLDOWN` to a number of seconds pauses between
+//! configurations.
 //!
 //! DO NOT add this example to the CI as it is slow.
 //!
@@ -28,10 +33,11 @@
 //!   is not.
 //! - prover CPU: user + system CPU time of the whole process over the same
 //!   span, from which the driver derives the share of cores in use.
-//! - peak RSS: on Linux, the peak resident set size over the prover span (the
-//!   kernel's high-water mark is reset right before proving, so setup
-//!   transients do not count, while the SRS and keys held in memory do). On
-//!   other platforms this falls back to the peak over the whole process.
+//! - peak RSS: on Linux, the peak resident set size over the prover span.
+//!   Right before proving, freed heap memory is returned to the OS and the
+//!   kernel's high-water mark is reset, so neither setup transients nor earlier
+//!   configurations count, while the SRS and keys held in memory do. On other
+//!   platforms this falls back to the peak over the whole process.
 //! - verifier: wall-clock time of the verification described above.
 //! - proof size: bytes of the folding proof (resp. of the `k` PLONK proofs).
 //!
@@ -46,9 +52,9 @@
 
 #[path = "circuits/ecdsa_threshold.rs"]
 mod ecdsa_threshold;
-#[allow(dead_code)] // `NB_PUBLIC_INPUTS` is unused here.
-#[path = "circuits/sha_multi.rs"]
-mod sha_multi;
+#[allow(dead_code)] // `K` and `NB_PUBLIC_INPUTS` are unused here.
+#[path = "circuits/sha_preimage.rs"]
+mod sha_preimage;
 
 use std::{
     env,
@@ -71,7 +77,7 @@ use midnight_zk_stdlib::{
     MidnightVK, Relation,
 };
 use rand::rngs::OsRng;
-use sha_multi::{ShaMultiCircuit, N_SHA};
+use sha_preimage::ShaPreimageCircuit;
 
 type F = midnight_curves::Fq;
 type H = PoseidonState<F>;
@@ -101,6 +107,16 @@ mod usage {
     /// Returns `false` where that is unsupported (anything but Linux).
     pub fn reset_peak_rss() -> bool {
         std::fs::write("/proc/self/clear_refs", "5").is_ok()
+    }
+
+    /// Returns freed heap memory to the OS, so that memory released by an
+    /// earlier configuration does not inflate the next one's peak RSS.
+    pub fn release_free_memory() {
+        // SAFETY: `malloc_trim` has no preconditions.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0);
+        }
     }
 
     /// Peak RSS in bytes: `VmHWM` (since the last reset) on Linux, otherwise
@@ -158,6 +174,7 @@ struct Measurement {
 /// Runs `f` as the prover span: returns its output, wall time, CPU time and
 /// peak RSS.
 fn measure_prover<T>(f: impl FnOnce() -> T) -> (T, Duration, Duration, u64) {
+    usage::release_free_memory();
     usage::reset_peak_rss();
     let cpu = usage::cpu_time();
     let t = Instant::now();
@@ -331,8 +348,7 @@ fn run<R: Relation>(
     sample: fn() -> (R::Instance, R::Witness),
     circuit: &str,
     description: &str,
-    scheme: Scheme,
-    k: usize,
+    configs: &[(Scheme, usize)],
     reps: usize,
 ) where
     R::Error: Debug,
@@ -352,11 +368,9 @@ fn run<R: Relation>(
 
     println!(
         "BENCH {{\"type\":\"setup\",\"circuit\":\"{circuit}\",\"description\":\"{description}\",\
-         \"scheme\":\"{}\",\"k\":{k},\"reps\":{reps},\"k_log\":{k_log},\"rows\":{},\
-         \"table_rows\":{},\"degree\":{},\"advice_columns\":{},\"fixed_columns\":{},\
-         \"lookups\":{},\"permutations\":{},\"nb_public_inputs\":{},\"threads\":{},\
-         \"peak_rss_scope\":\"{}\",\"setup_s\":{:.6}}}",
-        scheme.name(),
+         \"k_log\":{k_log},\"rows\":{},\"table_rows\":{},\"degree\":{},\"advice_columns\":{},\
+         \"fixed_columns\":{},\"lookups\":{},\"permutations\":{},\"nb_public_inputs\":{},\
+         \"threads\":{},\"peak_rss_scope\":\"{}\",\"setup_s\":{:.6}}}",
         model.rows,
         model.table_rows,
         model.max_deg,
@@ -370,8 +384,7 @@ fn run<R: Relation>(
         setup.as_secs_f64(),
     );
     eprintln!(
-        "[{circuit}/{}/k={k}] setup {setup:.2?} (K={k_log}, {} rows)",
-        scheme.name(),
+        "[{circuit}] setup {setup:.2?} (K={k_log}, {} rows)",
         model.rows
     );
 
@@ -383,66 +396,83 @@ fn run<R: Relation>(
         vk,
         pk,
     };
+    let cooldown = env::var("ACCORDION_BENCH_COOLDOWN")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&s| s > 0.0)
+        .map(Duration::from_secs_f64);
 
-    for rep in 0..reps {
-        let m = measure_once(&ctx, scheme, k);
-        println!(
-            "BENCH {{\"type\":\"rep\",\"rep\":{rep},\"prover_s\":{:.6},\"prover_cpu_s\":{:.6},\
-             \"peak_rss_bytes\":{},\"verifier_s\":{:.6},\"proof_bytes\":{}}}",
-            m.prover.as_secs_f64(),
-            m.prover_cpu.as_secs_f64(),
-            m.peak_rss,
-            m.verifier.as_secs_f64(),
-            m.proof_bytes,
-        );
-        eprintln!(
-            "[{circuit}/{}/k={k}] rep {}/{reps}: prover {:.2?}, verifier {:.2?}, \
-             proof {} B, peak RSS {} MiB",
-            scheme.name(),
-            rep + 1,
-            m.prover,
-            m.verifier,
-            m.proof_bytes,
-            m.peak_rss >> 20,
-        );
+    for (i, &(scheme, k)) in configs.iter().enumerate() {
+        if let (Some(pause), true) = (cooldown, i > 0) {
+            std::thread::sleep(pause);
+        }
+        let name = scheme.name();
+        println!("BENCH {{\"type\":\"config\",\"scheme\":\"{name}\",\"k\":{k}}}");
+        for rep in 0..reps {
+            let m = measure_once(&ctx, scheme, k);
+            println!(
+                "BENCH {{\"type\":\"rep\",\"scheme\":\"{name}\",\"k\":{k},\"rep\":{rep},\
+                 \"prover_s\":{:.6},\"prover_cpu_s\":{:.6},\"peak_rss_bytes\":{},\
+                 \"verifier_s\":{:.6},\"proof_bytes\":{}}}",
+                m.prover.as_secs_f64(),
+                m.prover_cpu.as_secs_f64(),
+                m.peak_rss,
+                m.verifier.as_secs_f64(),
+                m.proof_bytes,
+            );
+            eprintln!(
+                "[{circuit}/{name}/k={k}] rep {}/{reps}: prover {:.2?}, verifier {:.2?}, \
+                 proof {} B, peak RSS {} MiB",
+                rep + 1,
+                m.prover,
+                m.verifier,
+                m.proof_bytes,
+                m.peak_rss >> 20,
+            );
+        }
     }
 }
 
 fn usage_and_exit() -> ! {
     eprintln!(
-        "usage: accordion_bench <sha|ecdsa> <accordion|plonk> <k> [reps]\n\
+        "usage: accordion_bench <sha|ecdsa> <reps> <accordion|plonk>:<k>...\n\
+         \n  e.g. accordion_bench ecdsa 5 accordion:8 plonk:8\
          \n  accordion widths: {ACCORDION_WIDTHS:?}; plonk accepts any k >= 1"
     );
     process::exit(2);
 }
 
-fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 3 || args.len() > 4 {
-        usage_and_exit();
-    }
-    let scheme = match args[1].as_str() {
+/// Parses a `scheme:k` configuration.
+fn parse_config(arg: &str) -> Option<(Scheme, usize)> {
+    let (scheme, k) = arg.split_once(':')?;
+    let scheme = match scheme {
         "accordion" => Scheme::Accordion,
         "plonk" => Scheme::Plonk,
-        _ => usage_and_exit(),
+        _ => return None,
     };
-    let k: usize = args[2].parse().unwrap_or_else(|_| usage_and_exit());
-    let reps: usize = match args.get(3) {
-        Some(r) => r.parse().unwrap_or_else(|_| usage_and_exit()),
-        None => 1,
-    };
-    if k == 0 || reps == 0 || (scheme == Scheme::Accordion && !ACCORDION_WIDTHS.contains(&k)) {
+    let k: usize = k.parse().ok()?;
+    let valid = k > 0 && (scheme == Scheme::Plonk || ACCORDION_WIDTHS.contains(&k));
+    valid.then_some((scheme, k))
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() < 3 {
         usage_and_exit();
     }
+    let reps: usize = args[1].parse().ok().filter(|&r| r > 0).unwrap_or_else(|| usage_and_exit());
+    let configs: Vec<(Scheme, usize)> = args[2..]
+        .iter()
+        .map(|a| parse_config(a).unwrap_or_else(|| usage_and_exit()))
+        .collect();
 
     match args[0].as_str() {
         "sha" => run(
-            &ShaMultiCircuit,
-            sha_multi::random_instance,
+            &ShaPreimageCircuit,
+            sha_preimage::random_instance,
             "sha",
-            &format!("{N_SHA}x SHA-256 of a 192-bit preimage"),
-            scheme,
-            k,
+            "SHA-256 of a 192-bit preimage",
+            &configs,
             reps,
         ),
         "ecdsa" => run(
@@ -454,8 +484,7 @@ fn main() {
                 ecdsa_threshold::T,
                 ecdsa_threshold::N
             ),
-            scheme,
-            k,
+            &configs,
             reps,
         ),
         _ => usage_and_exit(),
