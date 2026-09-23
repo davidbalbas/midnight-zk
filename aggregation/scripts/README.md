@@ -5,7 +5,7 @@ Note: The benchmark pipeline has been co-authored with Claude Opus 5.
 `bench_accordion.py` compares two ways of proving `k` instances of the same
 circuit:
 
-- **Accordion**: a single Protogalaxy fold of the `k` instances (one-shot: the
+- **Accordion**: a single Accordion fold of the `k` instances (one-shot: the
   fold ends with a corrected PLONK proof of the folded instance).
 - **k-Plonk**: `k` independent PLONK proofs, generated one after another.
 
