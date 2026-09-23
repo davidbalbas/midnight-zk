@@ -1,9 +1,15 @@
-# Midnight ZK
+# Midnight ZK + Accordion
 
 [![Crates.io Version](https://img.shields.io/crates/v/midnight-proofs?label=midnight-proofs)](https://crates.io/crates/midnight-proofs)
 [![Crates.io Version](https://img.shields.io/crates/v/midnight-curves?label=midnight-curves)](https://crates.io/crates/midnight-curves)
 [![Crates.io Version](https://img.shields.io/crates/v/midnight-circuits?label=midnight-circuits)](https://crates.io/crates/midnight-circuits)
 [![Crates.io Version](https://img.shields.io/crates/v/midnight-zk-stdlib?label=midnight-zk-stdlib)](https://crates.io/crates/midnight-zk-stdlib)
+
+**For Accordion benchmarks, please check out the README in `aggregation/scripts`.** 
+
+Everything below this line is copied from `midnight-zk`.
+
+---
 
 This repository implements the proof system used in **Midnight**, along with tooling for building zero-knowledge circuits.
 
