@@ -31,9 +31,13 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 rand_chacha = { workspace = true }
+libc = "0.2"
 
 [[example]]
 name = "protogalaxy"
+
+[[example]]
+name = "accordion_bench"
 
 [[example]]
 name = "ivc"

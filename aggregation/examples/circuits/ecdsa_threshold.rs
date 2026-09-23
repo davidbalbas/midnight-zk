@@ -1,0 +1,234 @@
+//! Threshold ECDSA circuit: knowledge of `T` out of `N` Bitcoin (secp256k1)
+//! ECDSA signatures on a public message.
+//!
+//! Port of `zk_stdlib/examples/bitcoin_ecdsa_threshold.rs` (which is not
+//! importable from here), with `N = 16`, `T = 15` and a sampler for fresh
+//! instance–witness pairs.
+
+use ff::Field;
+use group::Curve;
+use midnight_circuits::{
+    field::foreign::{params::MultiEmulationParams as MEP, AssignedField},
+    instructions::{
+        ArithInstructions, AssignmentInstructions, DecompositionInstructions, EccInstructions,
+        PublicInputInstructions, ZeroInstructions,
+    },
+    testing_utils::ecdsa::{ECDSASig, Ecdsa},
+    types::{AssignedForeignPoint, InnerValue, Instantiable},
+    CircuitField,
+};
+use midnight_curves::k256::{Fq as K256Scalar, K256};
+use midnight_proofs::{
+    circuit::{Layouter, Value},
+    plonk::Error,
+};
+use midnight_zk_stdlib::{Relation, ZkStdLib, ZkStdLibArch};
+use rand::{prelude::SliceRandom, rngs::OsRng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+
+type F = midnight_curves::Fq;
+
+/// The total number of public keys.
+pub const N: usize = 16;
+/// The threshold of valid signatures.
+pub const T: usize = 15;
+
+type PK = K256;
+type MsgHash = K256Scalar;
+
+#[derive(Clone, Debug, Default)]
+pub struct EcdsaThresholdCircuit;
+
+impl Relation for EcdsaThresholdCircuit {
+    // The actual message should be hashed by the verifier. Since this example
+    // is "public message", we work directly with its hash for simplicity.
+    type Instance = (MsgHash, [PK; N]);
+
+    type Witness = [(PK, ECDSASig); T];
+
+    type Error = Error;
+
+    fn format_instance((msg_hash, pks): &Self::Instance) -> Result<Vec<F>, Error> {
+        Ok([
+            AssignedField::<F, K256Scalar, MEP>::as_public_input(msg_hash),
+            pks.iter()
+                .flat_map(AssignedForeignPoint::<F, K256, MEP>::as_public_input)
+                .collect::<Vec<_>>(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect())
+    }
+
+    fn circuit(
+        &self,
+        std_lib: &ZkStdLib,
+        layouter: &mut impl Layouter<F>,
+        instance: Value<Self::Instance>,
+        witness: Value<Self::Witness>,
+    ) -> Result<(), Error> {
+        let secp256k1_curve = std_lib.secp256k1();
+        let secp256k1_scalar = secp256k1_curve.scalar_field_chip();
+        let secp256k1_base = secp256k1_curve.base_field_chip();
+
+        // Assign the message hash as a public input.
+        let msg_hash = secp256k1_scalar.assign_as_public_input(layouter, instance.unzip().0)?;
+
+        // Assign the PKs and constrain them as public inputs.
+        let pks = secp256k1_curve.assign_many(layouter, &instance.unzip().1.transpose_array())?;
+        pks.iter()
+            .try_for_each(|pk| secp256k1_curve.constrain_as_public_input(layouter, pk))?;
+
+        // Assigned the public keys with known signature asserting they are on the set
+        // of public keys.
+        let signatures = witness.transpose_array();
+        let selected_pks_values = signatures.map(|v| v.map(|(pk, _)| pk));
+        let selected_sigs_values = signatures.map(|v| v.map(|(_, s)| s));
+
+        let assigned_selected_pks =
+            secp256k1_curve.k_out_of_n_points(layouter, &pks, &selected_pks_values)?;
+
+        // For every i, we need to verify that:
+        //   s_i * K_i  =?=  msg_hash * G + r_i * PK_i
+        //
+        // where K_i is a witnessed point different from the identity and whose
+        // x-coordinate equals r_i.
+        // We will batch the above equation with some randomness α derived from the
+        // signatures with Poseidon. The equation becomes:
+        //
+        //  \sum_i (α^i * r_i * PK_i - α^i * s_i * K_i) + (sum_i α^i) * msg_hash * G
+        //   =?=
+        //   id
+
+        // TODO: For now, and because this is a PoC, let alpha be fixed, which should be
+        // derived with Poseidon instead.
+        let alpha: AssignedField<F, K256Scalar, _> =
+            secp256k1_scalar.assign_fixed(layouter, K256Scalar::from(42u64))?;
+
+        let mut alpha_powers: [_; T] = core::array::from_fn(|_| alpha.clone());
+        for i in 1..T {
+            alpha_powers[i] = secp256k1_scalar.mul(layouter, &alpha_powers[i - 1], &alpha, None)?;
+        }
+
+        let neg_s_i_times_alpha_i = selected_sigs_values
+            .iter()
+            .zip(alpha_powers.iter())
+            .map(|(sig_i, alpha_i)| {
+                let neg_s_i = secp256k1_scalar.assign(layouter, sig_i.map(|sig| -sig.get_s()))?;
+                secp256k1_scalar.mul(layouter, &neg_s_i, alpha_i, None)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let r_i_as_le_bytes = selected_sigs_values
+            .iter()
+            .map(|sig_i| std_lib.assign_many(layouter, &sig_i.map(|v| v.get_r()).transpose_array()))
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let r_i_as_scalar = r_i_as_le_bytes
+            .iter()
+            .map(|bytes| secp256k1_scalar.assigned_from_le_bytes(layouter, bytes))
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let r_i_as_base = r_i_as_le_bytes
+            .iter()
+            .map(|bytes| secp256k1_base.assigned_from_le_bytes(layouter, bytes))
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let r_i_times_alpha_i = r_i_as_scalar
+            .iter()
+            .zip(alpha_powers.iter())
+            .map(|(r_i, alpha_i)| secp256k1_scalar.mul(layouter, r_i, alpha_i, None))
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let k_points = signatures
+            .iter()
+            .zip(r_i_as_base.iter())
+            .map(|(val, r_i)| {
+                let k_point_y_val = val.zip(instance.unzip().0).zip(r_i.value()).map(
+                    |(((pk_i, sig_i), msg_hash), r_i)| {
+                        let generator = K256::generator();
+                        let r_as_scalar = K256Scalar::from_bytes_le(&sig_i.get_r()).unwrap();
+                        let s_inv = sig_i.get_s().invert().unwrap();
+                        let k_point = generator * (s_inv * msg_hash) + pk_i * (s_inv * r_as_scalar);
+
+                        // CPU sanity check.
+                        assert_eq!(r_i, k_point.to_affine().x());
+                        k_point.to_affine().y()
+                    },
+                );
+
+                let y_i = secp256k1_base.assign(layouter, k_point_y_val)?;
+                secp256k1_curve.point_from_coordinates(layouter, r_i, &y_i)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let sum_alphas = {
+            let terms = alpha_powers
+                .iter()
+                .map(|alpha_i| (K256Scalar::ONE, alpha_i.clone()))
+                .collect::<Vec<_>>();
+            secp256k1_scalar.linear_combination(layouter, &terms, K256Scalar::ZERO)
+        }?;
+        let sum_alphas_times_msg_hash =
+            secp256k1_scalar.mul(layouter, &sum_alphas, &msg_hash, None)?;
+
+        let generator = secp256k1_curve.assign_fixed(layouter, K256::generator())?;
+        let mut bases = vec![generator];
+        bases.extend(assigned_selected_pks);
+        bases.extend(k_points);
+
+        let mut scalars = vec![sum_alphas_times_msg_hash];
+        scalars.extend(r_i_times_alpha_i);
+        scalars.extend(neg_s_i_times_alpha_i);
+
+        let res = secp256k1_curve.msm(layouter, &scalars, &bases)?;
+
+        secp256k1_curve.assert_zero(layouter, &res)
+    }
+
+    fn used_chips(&self) -> ZkStdLibArch {
+        ZkStdLibArch {
+            secp256k1: true,
+            nr_pow2range_cols: 4,
+            ..ZkStdLibArch::default()
+        }
+    }
+
+    fn write_relation<W: std::io::Write>(&self, _writer: &mut W) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn read_relation<R: std::io::Read>(_reader: &mut R) -> std::io::Result<Self> {
+        Ok(EcdsaThresholdCircuit)
+    }
+}
+
+/// Samples a random instance–witness pair: `N` fresh key pairs, a random
+/// message hash, and valid signatures under `T` randomly chosen keys.
+pub fn random_instance() -> ((MsgHash, [PK; N]), [(PK, ECDSASig); T]) {
+    let mut rng = ChaCha8Rng::from_rng(OsRng).expect("failed to seed ChaCha8Rng");
+    let msg_hash = K256Scalar::random(&mut rng);
+
+    let keys: [_; N] = core::array::from_fn(|_| Ecdsa::keygen(&mut rng));
+    let pks = keys.map(|(pk, _)| pk);
+
+    let mut indices: Vec<usize> = (0..N).collect();
+    indices.shuffle(&mut rng);
+
+    let mut idxs_of_known_sigs = indices[..T].to_vec();
+    idxs_of_known_sigs.sort();
+
+    let signatures: [(PK, ECDSASig); T] = idxs_of_known_sigs
+        .into_iter()
+        .map(|i| (keys[i].0, Ecdsa::sign(&keys[i].1, &msg_hash, &mut rng)))
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
+    // Sanity check on the generated signatures.
+    signatures.iter().for_each(|(pk, sig)| {
+        assert!(Ecdsa::verify(pk, &msg_hash, sig));
+    });
+
+    ((msg_hash, pks), signatures)
+}
